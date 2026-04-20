@@ -675,26 +675,31 @@ def _run_with_triton_viz(client):
     return triton_viz
 
 
+def _maybe_save_trace(tv, path: str) -> bool:
+    """Try to persist a triton-viz trace; silently skip on older versions."""
+    save_fn = getattr(tv, "save", None)
+    if save_fn is None:
+        print(f"[triton-viz] installed version has no .save(); skipping {path}")
+        return False
+    save_fn(path)
+    print(f"[triton-viz] trace saved to {path}")
+    return True
+
+
 def _profile():
     """Run under triton-viz profiler (CPU interpreter) and print metrics."""
     from triton_viz.clients import Profiler
     tv = _run_with_triton_viz(Profiler())
     # The profiler prints per-op load/store byte counts and flags issues
-    # (non-unrolled loops, inefficient masks, etc.) on shutdown. We also
-    # save a trace so it can be opened in the visualizer UI afterwards.
-    trace_path = "unif_attn_profile.tvz"
-    tv.save(trace_path)
-    print(f"[triton-viz] profile trace saved to {trace_path}")
-    print(f"    open in UI: triton-visualizer {trace_path}")
+    # (non-unrolled loops, inefficient masks, etc.) on shutdown.
+    _maybe_save_trace(tv, "unif_attn_profile.tvz")
 
 
 def _visualize(port: int = 5001, share: bool = False):
-    """Run under triton-viz tracer, save trace, and launch the web UI."""
+    """Run under triton-viz tracer, save trace (if supported), and launch UI."""
     from triton_viz.clients import Tracer
     tv = _run_with_triton_viz(Tracer())
-    trace_path = "unif_attn_trace.tvz"
-    tv.save(trace_path)
-    print(f"[triton-viz] trace saved to {trace_path}")
+    _maybe_save_trace(tv, "unif_attn_trace.tvz")
     print(f"[triton-viz] launching UI on port {port} (share={share}) ...")
     tv.launch(share=share, port=port)
 
