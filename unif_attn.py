@@ -345,7 +345,10 @@ def kernel_unified_attention_2d(
         P = tl.math.exp2(S - m_j[:, None])
 
         # l_j : (BLOCK_M,)
-        l_j = tl.sum(P, axis=1)
+        # NOTE: pass `dtype=` explicitly — the Triton interpreter (used by
+        # triton-viz) otherwise infers `out_dtype=None` and crashes in
+        # `input.to(out_dtype)`. P is already fp32 so this is a no-op on GPU.
+        l_j = tl.sum(P, axis=1, dtype=tl.float32)
 
         # alpha : (BLOCK_M, )
         alpha = tl.math.exp2(M - m_j)
