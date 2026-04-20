@@ -1,5 +1,6 @@
 Downloaded from: https://triton-lang.org/main/getting-started/tutorials/index.html
 
+## Set-Up
 ```
 git clone git@github.com:almaslof/stunning-octo-pancake.git learn_triton
 
@@ -7,3 +8,12 @@ alias drun='docker run -it --rm --device /dev/dri --device /dev/kfd --network ho
 drun --name tttal lmsysorg/sglang:v0.5.7-rocm700-mi30x bash
 
 ```
+
+## To debug
+```
+TRITON_INTERPRET=1 python3 ttt.py
+import pdb; pdb.set_trace()
+```
+
+## Debug, profile, vizualize
+https://github.com/Deep-Learning-Profiling-Tools/triton-viz
