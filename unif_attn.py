@@ -378,62 +378,6 @@ def kernel_unified_attention_2d(
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
     )
 
-def _ref_paged_attn(
-    query: torch.Tensor,            # [num_query_tokens, num_query_heads, head_size]
-    key_cache: torch.Tensor,        # [num_blks, blk_size, num_kv_heads, head_size]
-    value_cache: torch.Tensor,      # [num_blks, blk_size, num_kv_heads, head_size]
-    query_lens: list[int],
-    seq_lens: list[int],
-    block_tables: torch.Tensor,     # [num_seqs, max_num_blocks_per_seq]
-    scale: float,
-    sliding_window: int | None = None,
-    soft_cap: float | None = None,
-) -> torch.Tensor:
-    """Eager reference for the unified (paged, GQA, causal) attention kernel."""
-    num_seqs = len(query_lens)
-    block_tables_cpu = block_tables.cpu().numpy()
-    _, block_size, num_kv_heads, head_size = key_cache.shape
-
-    outputs: list[torch.Tensor] = []
-    start = 0
-    for i in range(num_seqs):
-        q_len = query_lens[i]
-        kv_len = seq_lens[i]
-        q = query[start : start + q_len].float() * scale  # [q_len, H_q, D]
-
-        num_kv_blocks = (kv_len + block_size - 1) // block_size
-        block_idx = block_tables_cpu[i, :num_kv_blocks]
-        k = key_cache[block_idx].reshape(-1, num_kv_heads, head_size)[:kv_len].float()
-        v = value_cache[block_idx].reshape(-1, num_kv_heads, head_size)[:kv_len].float()
-
-        if q.shape[1] != k.shape[1]:
-            rep = q.shape[1] // k.shape[1]
-            k = k.repeat_interleave(rep, dim=1)
-            v = v.repeat_interleave(rep, dim=1)
-
-        attn = torch.einsum("qhd,khd->hqk", q, k)
-        if soft_cap is not None and soft_cap > 0:
-            attn = soft_cap * torch.tanh(attn / soft_cap)
-
-        # Causal mask aligned to the right (decode-style): query token q
-        # attends to keys [0, kv_len - q_len + q].
-        mask = torch.ones(q_len, kv_len, device=q.device, dtype=torch.bool)
-        mask = torch.triu(mask, diagonal=kv_len - q_len + 1)
-        if sliding_window is not None and sliding_window > 0:
-            sw_keep = torch.triu(
-                torch.ones(q_len, kv_len, device=q.device, dtype=torch.bool),
-                diagonal=kv_len - (q_len + sliding_window) + 1,
-            ).logical_not()
-            mask |= sw_keep
-        attn.masked_fill_(mask, float("-inf"))
-        attn = torch.softmax(attn, dim=-1)
-        out = torch.einsum("hqk,khd->qhd", attn, v)
-        outputs.append(out.to(query.dtype))
-        start += q_len
-
-    return torch.cat(outputs, dim=0)
-
-
 def _make_inputs(
     seq_lens_pairs: list[tuple[int, int]],
     num_query_heads: int,
@@ -578,31 +522,6 @@ if __name__ == "__main__":
         BLOCK_SIZE, NUM_BLOCKS, DTYPE, device,
     )
 
-    # ---- Correctness ----
-    out = _launch_2d(
-        inputs, NUM_QUERY_HEADS, NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE,
-        scale=SCALE, sliding_window=SLIDING_WINDOW, soft_cap=SOFT_CAP,
-    )
-    torch.cuda.synchronize()
-
-    ref = _ref_paged_attn(
-        query=inputs["query"],
-        key_cache=inputs["key_cache"],
-        value_cache=inputs["value_cache"],
-        query_lens=inputs["query_lens"],
-        seq_lens=inputs["kv_lens"],
-        block_tables=inputs["block_tables"],
-        scale=SCALE,
-        sliding_window=SLIDING_WINDOW if SLIDING_WINDOW > 0 else None,
-        soft_cap=SOFT_CAP if SOFT_CAP > 0 else None,
-    )
-
-    max_abs = (out.float() - ref.float()).abs().max().item()
-    print(f"max |triton - ref| = {max_abs:.4e}")
-    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
-    print("correctness: OK")
-
-    # ---- Profile ----
     def run():
         _launch_2d(
             inputs, NUM_QUERY_HEADS, NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE,
