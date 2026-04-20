@@ -1,5 +1,4 @@
 import triton
-import triton.language as tl
 import torch
 
 # Pick the FP8 E4M3 dtype for the current platform (AMD uses the "fnuz" variant).
