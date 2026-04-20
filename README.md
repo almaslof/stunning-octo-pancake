@@ -17,3 +17,10 @@ import pdb; pdb.set_trace()
 
 ## Debug, profile, vizualize
 https://github.com/Deep-Learning-Profiling-Tools/triton-viz
+
+
+```
+python3 unif_attn.py visualize --port 5001
+python3 unif_attn.py profile
+python3 unif_attn.py bench
+```
