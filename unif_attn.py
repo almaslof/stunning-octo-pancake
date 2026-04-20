@@ -11,6 +11,7 @@ else:
     e4m3_dtype = torch.float16  # very old torch; FP8 paths unused in the harness
 
 float8_info = torch.finfo(e4m3_dtype)
+from aiter_unified_attention import kernel_unified_attention_2d
 
 def _make_inputs(
     seq_lens_pairs: list[tuple[int, int]],
