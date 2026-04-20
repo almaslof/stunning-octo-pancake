@@ -1,7 +1,14 @@
 import triton
 import triton.language as tl
 import torch
-from aiter.ops.triton.utils.types import e4m3_dtype
+
+# Pick the FP8 E4M3 dtype for the current platform (AMD uses the "fnuz" variant).
+if hasattr(torch, "float8_e4m3fnuz") and torch.version.hip is not None:
+    e4m3_dtype = torch.float8_e4m3fnuz
+elif hasattr(torch, "float8_e4m3fn"):
+    e4m3_dtype = torch.float8_e4m3fn
+else:
+    e4m3_dtype = torch.float16  # very old torch; FP8 paths unused in the harness
 
 float8_info = torch.finfo(e4m3_dtype)
 
@@ -501,20 +508,49 @@ def _launch_2d(
     return out
 
 
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    assert device.type == "cuda", "Triton kernel requires a GPU."
+# ---------------------------------------------------------------------------
+# Benchmarking / profiling / visualization entry points.
+#
+# Modes (select via `python unif_attn.py <mode>`):
+#   bench     - time the kernel on real GPU with mixed prefill+decode batch
+#   profile   - run via triton-viz profiler (CPU interpreter), print stats
+#   visualize - run via triton-viz tracer (CPU interpreter), launch UI / save
+#
+# Both `profile` and `visualize` require `pip install triton-viz` and run the
+# kernel under the Triton interpreter (CPU), so they use very small inputs.
+# ---------------------------------------------------------------------------
 
-    # Mixed prefill + decode batch (same shape mix as the vLLM unit tests).
+
+# Tiny problem size used by the CPU-interpreter paths (triton-viz).
+# Keep everything small — the interpreter is orders of magnitude slower than
+# real GPU execution and the trace grows with tile count.
+_VIZ_CFG = dict(
+    seq_lens_pairs=[(2, 32)],   # 1 sequence, q_len=2, kv_len=32
+    num_query_heads=2,
+    num_kv_heads=1,             # GQA: 2 queries per KV head
+    head_size=16,
+    block_size=16,
+    num_blocks=4,
+    dtype=torch.float32,        # interpreter doesn't support bf16/fp8 well
+    sliding_window=0,
+    soft_cap=0.0,
+)
+
+
+def _bench():
+    """Time the kernel on a real GPU and print TFLOP/s."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    assert device.type == "cuda", "bench mode requires a GPU"
+
     SEQ_LENS = [(1, 1328), (5, 18), (129, 463)]
     NUM_QUERY_HEADS = 8
-    NUM_KV_HEADS = 2          # GQA: 4 queries per KV head
+    NUM_KV_HEADS = 2
     HEAD_SIZE = 128
     BLOCK_SIZE = 16
     NUM_BLOCKS = 2048
     DTYPE = torch.bfloat16
-    SLIDING_WINDOW = 0        # set >0 to exercise SWA path
-    SOFT_CAP = 0.0            # set >0 to exercise softcap path
+    SLIDING_WINDOW = 0
+    SOFT_CAP = 0.0
     SCALE = HEAD_SIZE ** -0.5
 
     inputs = _make_inputs(
@@ -531,13 +567,153 @@ if __name__ == "__main__":
     ms = triton.testing.do_bench(run, warmup=25, rep=100)
     total_q = sum(inputs["query_lens"])
     total_kv = sum(inputs["kv_lens"])
-    # Rough per-token attention FLOPs: 4 * H_q * D * sum(q_i * k_i)
-    flops = 0
-    for q_len, kv_len in zip(inputs["query_lens"], inputs["kv_lens"]):
-        flops += 4 * NUM_QUERY_HEADS * HEAD_SIZE * q_len * kv_len
+    flops = sum(
+        4 * NUM_QUERY_HEADS * HEAD_SIZE * q_len * kv_len
+        for q_len, kv_len in zip(inputs["query_lens"], inputs["kv_lens"])
+    )
     tflops = flops / (ms * 1e-3) / 1e12
     print(
         f"latency: {ms:.3f} ms | "
         f"q_tokens={total_q} kv_tokens={total_kv} | "
         f"~{tflops:.2f} TFLOP/s"
     )
+
+
+def _run_with_triton_viz(client):
+    """Launch `kernel_unified_attention_2d` under the Triton interpreter with
+    a triton-viz client attached. Returns the triton_viz module."""
+    import triton_viz  # noqa: F401 — imported for side effects / .launch()
+
+    # Wrap the kernel with the desired client. triton-viz intercepts the
+    # @triton.jit kernel and re-dispatches via the interpreter.
+    traced_kernel = triton_viz.trace(client=client)(kernel_unified_attention_2d)
+
+    cfg = _VIZ_CFG
+    num_query_heads = cfg["num_query_heads"]
+    num_kv_heads = cfg["num_kv_heads"]
+    head_size = cfg["head_size"]
+    block_size = cfg["block_size"]
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    scale = head_size ** -0.5
+
+    inputs = _make_inputs(
+        cfg["seq_lens_pairs"], num_query_heads, num_kv_heads, head_size,
+        block_size, cfg["num_blocks"], cfg["dtype"], torch.device("cpu"),
+    )
+
+    q = inputs["query"]
+    k_cache = inputs["key_cache"]
+    v_cache = inputs["value_cache"]
+    out = inputs["output"]
+    cu_seqlens_q = inputs["cu_seqlens_q"]
+    seq_lens = inputs["seq_lens"]
+    block_tables = inputs["block_tables"]
+    num_seqs = seq_lens.shape[0]
+
+    BLOCK_M = 16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
+    BLOCK_Q = BLOCK_M // num_queries_per_kv
+    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+    HEAD_SIZE_PADDED = triton.next_power_of_2(head_size)
+    grid = (num_kv_heads, total_num_q_blocks)
+
+    print(
+        f"[triton-viz] interpreter launch grid={grid} "
+        f"q_tokens={q.shape[0]} kv_len={inputs['kv_lens']} "
+        f"BLOCK_M={BLOCK_M} BLOCK_Q={BLOCK_Q} TILE_SIZE={block_size}"
+    )
+
+    traced_kernel[grid](
+        output_ptr=out,
+        query_ptr=q,
+        key_cache_ptr=k_cache,
+        value_cache_ptr=v_cache,
+        sink_ptr=None,
+        block_tables_ptr=block_tables,
+        seq_lens_ptr=seq_lens,
+        alibi_slopes_ptr=None,
+        qq_bias_ptr=None,
+        scale=scale,
+        q_descale_ptr=None,
+        k_descale_ptr=None,
+        v_descale_ptr=None,
+        out_scale_ptr=None,
+        softcap=cfg["soft_cap"],
+        num_query_heads=num_query_heads,
+        num_queries_per_kv=num_queries_per_kv,
+        block_table_stride=block_tables.stride(0),
+        query_stride_0=q.stride(0),
+        query_stride_1=q.stride(1),
+        output_stride_0=out.stride(0),
+        output_stride_1=out.stride(1),
+        qq_bias_stride_0=0,
+        BLOCK_SIZE=block_size,
+        TILE_SIZE=block_size,
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
+        USE_ALIBI_SLOPES=False,
+        USE_QQ_BIAS=False,
+        USE_SOFTCAP=(cfg["soft_cap"] > 0),
+        USE_SINKS=False,
+        SLIDING_WINDOW=cfg["sliding_window"],
+        stride_k_cache_0=k_cache.stride(0),
+        stride_k_cache_1=k_cache.stride(1),
+        stride_k_cache_2=k_cache.stride(2),
+        stride_k_cache_3=k_cache.stride(3),
+        stride_v_cache_0=v_cache.stride(0),
+        stride_v_cache_1=v_cache.stride(1),
+        stride_v_cache_2=v_cache.stride(2),
+        stride_v_cache_3=v_cache.stride(3),
+        query_start_len_ptr=cu_seqlens_q,
+        BLOCK_Q=BLOCK_Q,
+        num_seqs=num_seqs,
+        BLOCK_M=BLOCK_M,
+        ALL_DECODE=False,
+    )
+    return triton_viz
+
+
+def _profile():
+    """Run under triton-viz profiler (CPU interpreter) and print metrics."""
+    from triton_viz.clients import Profiler
+    tv = _run_with_triton_viz(Profiler())
+    # The profiler prints per-op load/store byte counts and flags issues
+    # (non-unrolled loops, inefficient masks, etc.) on shutdown. We also
+    # save a trace so it can be opened in the visualizer UI afterwards.
+    trace_path = "unif_attn_profile.tvz"
+    tv.save(trace_path)
+    print(f"[triton-viz] profile trace saved to {trace_path}")
+    print(f"    open in UI: triton-visualizer {trace_path}")
+
+
+def _visualize(port: int = 5001, share: bool = False):
+    """Run under triton-viz tracer, save trace, and launch the web UI."""
+    from triton_viz.clients import Tracer
+    tv = _run_with_triton_viz(Tracer())
+    trace_path = "unif_attn_trace.tvz"
+    tv.save(trace_path)
+    print(f"[triton-viz] trace saved to {trace_path}")
+    print(f"[triton-viz] launching UI on port {port} (share={share}) ...")
+    tv.launch(share=share, port=port)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="kernel_unified_attention_2d driver")
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        default="bench",
+        choices=["bench", "profile", "visualize"],
+        help="bench: time on GPU; profile/visualize: run under triton-viz on CPU",
+    )
+    parser.add_argument("--port", type=int, default=5001, help="visualize: UI port")
+    parser.add_argument("--share", action="store_true", help="visualize: public share")
+    args = parser.parse_args()
+
+    if args.mode == "bench":
+        _bench()
+    elif args.mode == "profile":
+        _profile()
+    else:
+        _visualize(port=args.port, share=args.share)
