@@ -169,7 +169,7 @@ def _bench():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     assert device.type == "cuda", "bench mode requires a GPU"
 
-    SEQ_LENS = [(1, 1328), (5, 18), (129, 463)]
+    SEQ_LENS = [(1, 1328), (5, 18), (129, 463), (1024, 1024), (700, 70000)]
     NUM_QUERY_HEADS = 8
     NUM_KV_HEADS = 2
     HEAD_SIZE = 128
