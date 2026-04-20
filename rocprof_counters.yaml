@@ -1,0 +1,59 @@
+# rocprofv3 multi-pass counter config for kernel_unified_attention_2d.
+#
+# Usage:
+#   rocprofv3 -i rocprof_counters.yaml -- python3 bench_unified_attention.py profile-run
+#
+# Each `jobs[]` entry runs the application once and collects one group of
+# counters. Groups are small enough to fit in the GPU's concurrent-counter
+# budget (typically ~8–16 per pass on gfx942/MI300X). See `rocprofv3 --list-avail`
+# for the full list of counters on your GPU.
+#
+# Only kernels matching kernel_include_regex are measured — this keeps noise
+# from Python / HIP runtime setup out of the CSV.
+
+jobs:
+  # -------- Pass 1: wave-level occupancy & overall busy --------
+  - pmc:
+      - SQ_WAVES              # total waves launched
+      - GRBM_COUNT            # GPU reference clock cycles
+      - GRBM_GUI_ACTIVE       # cycles the graphics/compute pipeline was busy
+      - CU_OCCUPANCY          # avg waves resident per CU (derived)
+      - GPUBusy               # % of time GPU was busy (derived)
+    kernel_include_regex: "kernel_unified_attention_2d"
+    truncate_kernels: true
+    output_directory: "rocprof_out/pass1_occupancy"
+
+  # -------- Pass 2: VALU + MFMA instruction mix --------
+  - pmc:
+      - SQ_INSTS_VALU         # VALU instruction count
+      - SQ_INSTS_MFMA         # MFMA (matrix) instruction count
+      - SQ_INSTS_SALU         # scalar ALU instructions
+      - SQ_INSTS_LDS          # LDS ops
+      - VALUUtilization       # % of active VALU slots (derived)
+      - VALUBusy              # % of time VALU was active (derived)
+    kernel_include_regex: "kernel_unified_attention_2d"
+    truncate_kernels: true
+    output_directory: "rocprof_out/pass2_compute"
+
+  # -------- Pass 3: global memory traffic --------
+  - pmc:
+      - SQ_INSTS_VMEM_RD      # vector-memory loads
+      - SQ_INSTS_VMEM_WR      # vector-memory stores
+      - FETCH_SIZE            # bytes fetched from HBM
+      - WRITE_SIZE            # bytes written to HBM
+      - MemUnitBusy           # % of time memory unit was busy (derived)
+      - MemUnitStalled        # % of time memory unit was stalled (derived)
+    kernel_include_regex: "kernel_unified_attention_2d"
+    truncate_kernels: true
+    output_directory: "rocprof_out/pass3_memory"
+
+  # -------- Pass 4: cache hit rates --------
+  - pmc:
+      - TCC_HIT_sum           # L2 hits
+      - TCC_MISS_sum          # L2 misses
+      - TCP_TCP_TA_DATA_STALL_CYCLES_sum  # L1 stall cycles
+      - L2CacheHit            # L2 hit rate (derived)
+      - L1CacheHit            # L1 hit rate if exposed (derived)
+    kernel_include_regex: "kernel_unified_attention_2d"
+    truncate_kernels: true
+    output_directory: "rocprof_out/pass4_cache"

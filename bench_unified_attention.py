@@ -206,6 +206,52 @@ def _bench():
     )
 
 
+def _profile_run(iters: int = 10, warmup: int = 3):
+    """Launch the kernel `iters` times with explicit syncs between launches.
+
+    Intended to be wrapped by an external profiler (e.g. `rocprofv3`). Does
+    NOT time anything itself — we want the profiler to see the cleanest
+    possible sequence of kernel dispatches. The first `warmup` iterations
+    exercise the Triton JIT cache so subsequent launches don't include
+    compilation overhead.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    assert device.type == "cuda", "profile-run mode requires a GPU"
+
+    SEQ_LENS = [(1, 1328), (5, 18), (129, 463), (1024, 1024)]
+    NUM_QUERY_HEADS = 8
+    NUM_KV_HEADS = 2
+    HEAD_SIZE = 128
+    BLOCK_SIZE = 16
+    NUM_BLOCKS = 2048
+    DTYPE = torch.bfloat16
+    SLIDING_WINDOW = 0
+    SOFT_CAP = 0.0
+    SCALE = HEAD_SIZE ** -0.5
+
+    inputs = _make_inputs(
+        SEQ_LENS, NUM_QUERY_HEADS, NUM_KV_HEADS, HEAD_SIZE,
+        BLOCK_SIZE, NUM_BLOCKS, DTYPE, device,
+    )
+
+    def run_once():
+        _launch_2d(
+            inputs, NUM_QUERY_HEADS, NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE,
+            scale=SCALE, sliding_window=SLIDING_WINDOW, soft_cap=SOFT_CAP,
+        )
+
+    print(f"[profile-run] warmup={warmup} iters={iters} seq_lens={SEQ_LENS}")
+    for _ in range(warmup):
+        run_once()
+    torch.cuda.synchronize()
+
+    for i in range(iters):
+        run_once()
+        torch.cuda.synchronize()
+
+    print(f"[profile-run] done: {iters} kernel launches recorded")
+
+
 def _run_with_triton_viz(client):
     """Launch `kernel_unified_attention_2d` under the Triton interpreter with
     a triton-viz client attached. Returns the triton_viz module."""
@@ -336,16 +382,23 @@ if __name__ == "__main__":
         "mode",
         nargs="?",
         default="bench",
-        choices=["bench", "profile", "visualize"],
-        help="bench: time on GPU; profile/visualize: run under triton-viz on CPU",
+        choices=["bench", "profile", "visualize", "profile-run"],
+        help=(
+            "bench: time on GPU; profile/visualize: run under triton-viz on CPU; "
+            "profile-run: deterministic N launches for external profilers (rocprofv3)"
+        ),
     )
     parser.add_argument("--port", type=int, default=5001, help="visualize: UI port")
     parser.add_argument("--share", action="store_true", help="visualize: public share")
+    parser.add_argument("--iters", type=int, default=10, help="profile-run: iterations")
+    parser.add_argument("--warmup", type=int, default=3, help="profile-run: warmup iters")
     args = parser.parse_args()
 
     if args.mode == "bench":
         _bench()
     elif args.mode == "profile":
         _profile()
+    elif args.mode == "profile-run":
+        _profile_run(iters=args.iters, warmup=args.warmup)
     else:
         _visualize(port=args.port, share=args.share)

@@ -20,7 +20,30 @@ https://github.com/Deep-Learning-Profiling-Tools/triton-viz
 
 
 ```
-python3 unif_attn.py visualize --port 5001
-python3 unif_attn.py profile
-python3 unif_attn.py bench
+python3 bench_unified_attention.py visualize --port 5001
+python3 bench_unified_attention.py profile
+python3 bench_unified_attention.py bench
 ```
+
+## Profile on AMD GPU with rocprofv3
+Docs: https://rocm.docs.amd.com/projects/rocprofiler-sdk/en/latest/how-to/using-rocprofv3.html
+
+```
+# per-launch kernel trace (CSV)
+./profile_rocprof.sh trace
+
+# perfetto timeline (open at https://ui.perfetto.dev)
+./profile_rocprof.sh pftrace
+
+# summary stats
+./profile_rocprof.sh stats
+
+# multi-pass hardware counters (occupancy / VALU / MFMA / memory / cache)
+./profile_rocprof.sh pmc
+
+# or everything at once
+./profile_rocprof.sh all --iters 20 --out rocprof_out/run1
+```
+
+Outputs go to `rocprof_out/<mode>/` (per-pass counters land in
+`rocprof_out/passN_*` as declared in `rocprof_counters.yaml`).
