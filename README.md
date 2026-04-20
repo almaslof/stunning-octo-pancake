@@ -3,7 +3,7 @@ Downloaded from: https://triton-lang.org/main/getting-started/tutorials/index.ht
 ```
 git clone git@github.com:almaslof/stunning-octo-pancake.git learn_triton
 
-python3 -m venv .venv
-source .venv/bin/activate
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2
+alias drun='docker run -it --rm --device /dev/dri --device /dev/kfd --network host --ipc host --group-add video --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged -v $(pwd):/persistent --shm-size 256G -e HIP_VISIBLE_DEVICES=0,1,2,3'
+drun --name tttal lmsysorg/sglang:v0.5.7-rocm700-mi30x bash
+
 ```
