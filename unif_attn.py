@@ -377,3 +377,6 @@ def kernel_unified_attention_2d(
         acc,
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
     )
+
+if __name__ == "__main__":
+    # test kernel_unified_attention_2d
